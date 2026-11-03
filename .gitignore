@@ -1,0 +1,5 @@
+*.json
+*.zip
+env.yaml
+__pycache__/
+*.pyc
