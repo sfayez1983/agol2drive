@@ -297,6 +297,13 @@ def run_sync(where: str, max_features: int = 25) -> dict:
     verify_layer(token)                                 # (5)
     svc = drive()
 
+    try:
+        healed = auto_heal(token, svc)
+        if healed:
+            log.info('auto-heal cleared %d feature(s)', healed)
+    except Exception as e:
+        log.warning('auto-heal skipped: %s', e)
+
     all_ids = agol("query", token, where=where,
                    returnIdsOnly="true").get("objectIds", []) or []
     # keep only candidates that actually have image attachments, so photo-less
@@ -594,3 +601,72 @@ def od_share_link(at, folder_id):
         if r.status_code in (200, 201):
             return r.json().get("link", {}).get("webUrl")
     return None
+
+
+# ===== Auto-heal: fix merged folders when Block/Shop edited after link exists =====
+import base64 as _b64_heal
+from collections import defaultdict as _dd_heal
+
+def _query_all(token, out_fields):
+    out = []; off = 0
+    while True:
+        j = agol("query", token, where="1=1", outFields=out_fields,
+                 returnGeometry="false", resultOffset=off, resultRecordCount=1000)
+        rows = j.get("features", [])
+        out += rows
+        if not j.get("exceededTransferLimit") or not rows:
+            break
+        off += len(rows)
+    return out
+
+def auto_heal(token, svc):
+    """Detect folders shared by >1 feature (e.g. after a Block_No edit),
+    trash the shared folder, and clear those features' links so the normal
+    sync rebuilds a clean, correctly-named folder for each. Cheap: one query
+    when there is nothing to heal."""
+    feats = _query_all(token, f"{OID_FIELD},{F_LINK},{F_OD_LINK}")
+    dmap = _dd_heal(set); omap = _dd_heal(set)
+    for ft in feats:
+        a = ft["attributes"]; oid = a[OID_FIELD]
+        if a.get(F_LINK):    dmap[a[F_LINK]].add(oid)
+        if a.get(F_OD_LINK): omap[a[F_OD_LINK]].add(oid)
+    drive_bad = {k: v for k, v in dmap.items() if len(v) > 1}
+    od_bad    = {k: v for k, v in omap.items() if len(v) > 1}
+    bad = set()
+    for v in drive_bad.values(): bad |= v
+    for v in od_bad.values():    bad |= v
+    if not bad:
+        return 0
+    for link in drive_bad:
+        m = re.search(r"/folders/([A-Za-z0-9_-]+)", link)
+        if not m:
+            continue
+        try:
+            svc.files().update(fileId=m.group(1), body={"trashed": True},
+                               supportsAllDrives=True).execute()
+        except Exception as e:
+            log.warning("  heal: trash drive folder failed %s: %s", link, e)
+    if ENABLE_ONEDRIVE and od_bad:
+        try:
+            at = ms_token()
+            for link in od_bad:
+                try:
+                    enc = "u!" + _b64_heal.urlsafe_b64encode(link.encode()).decode().rstrip("=")
+                    it = http.get(f"{GRAPH}/shares/{enc}/driveItem",
+                                  headers={"Authorization": f"Bearer {at}"}, timeout=30)
+                    if it.status_code == 200:
+                        http.delete(f"{GRAPH}/me/drive/items/{it.json()['id']}",
+                                    headers={"Authorization": f"Bearer {at}"}, timeout=30)
+                except Exception as e:
+                    log.warning("  heal: trash onedrive folder failed %s: %s", link, e)
+        except Exception as e:
+            log.warning("  heal: onedrive token failed: %s", e)
+    updates = [{"attributes": {OID_FIELD: oid, F_LINK: None, F_OD_LINK: None}}
+               for oid in bad]
+    try:
+        agol("applyEdits", token, updates=_json_od.dumps(updates))
+    except Exception as e:
+        log.warning("  heal: clear links failed: %s", e)
+    log.info("auto-heal: cleared %d feature(s), trashed %d Drive + %d OneDrive folder(s)",
+             len(bad), len(drive_bad), len(od_bad))
+    return len(bad)
